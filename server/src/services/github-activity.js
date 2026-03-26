@@ -2,9 +2,6 @@ const axios = require('axios');
 
 const GITHUB_API = 'https://api.github.com';
 
-/**
- * Create an authenticated GitHub API client
- */
 function createClient(accessToken) {
   return axios.create({
     baseURL: GITHUB_API,
@@ -15,82 +12,88 @@ function createClient(accessToken) {
   });
 }
 
-/**
- * Fetch user's recent events from GitHub
- * Returns commits, PRs, and reviews from the last N days
- */
 async function fetchRecentActivity(accessToken, username, daysBack = 1) {
   const client = createClient(accessToken);
   const since = new Date();
   since.setDate(since.getDate() - daysBack);
-  since.setHours(0, 0, 0, 0); // Start of day to catch everything
+  since.setHours(0, 0, 0, 0);
 
   const activities = [];
+  const seenShas = new Set();
+  const repoCommitCache = {};
 
-  // 1. Fetch user events (commits, PR opens, etc.)
   try {
     const { data: events } = await client.get(
       `/users/${username}/events?per_page=100`
     );
 
-    console.log(`[DevLog] Fetched ${events.length} events from GitHub, filtering since ${since.toISOString()}`);
+    console.log(`[DevLog] Fetched ${events.length} events, filtering since ${since.toISOString()}`);
 
     for (const event of events) {
       const eventDate = new Date(event.created_at);
-      if (eventDate < since) {
-        console.log(`[DevLog] Skipped ${event.type} from ${event.created_at} (too old)`);
-        continue;
-      }
-      console.log(`[DevLog] Including ${event.type} in ${event.repo.name} from ${event.created_at}`);
+      if (eventDate < since) continue;
 
       if (event.type === 'PushEvent') {
         let commits = event.payload.commits || [];
-        
-        // GitHub Events API sometimes returns empty commits — fetch from repo API
-        if (commits.length === 0 && event.payload.size > 0) {
-          try {
-            const branch = event.payload.ref?.replace('refs/heads/', '') || 'main';
-            const { data: repoCommits } = await client.get(
-              `/repos/${event.repo.name}/commits?sha=${branch}&since=${since.toISOString()}&per_page=10`
-            );
-            commits = repoCommits.map(c => ({
-              sha: c.sha,
-              message: c.commit.message,
-            }));
-            console.log(`[DevLog] Fetched ${commits.length} commits from repo API for ${event.repo.name}`);
-          } catch (err) {
-            console.log(`[DevLog] Could not fetch commits from repo API: ${err.message}`);
+        const repoName = event.repo.name;
+        const branch = event.payload.ref?.replace('refs/heads/', '') || 'main';
+
+        // Fallback: fetch from repo API if payload is empty (cached per repo:branch)
+        if (commits.length === 0) {
+          const cacheKey = `${repoName}:${branch}`;
+
+          if (!repoCommitCache[cacheKey]) {
+            try {
+              const { data: repoCommits } = await client.get(
+                `/repos/${repoName}/commits?sha=${branch}&since=${since.toISOString()}&per_page=100`
+              );
+              repoCommitCache[cacheKey] = repoCommits.map(c => ({
+                sha: c.sha,
+                message: c.commit.message,
+              }));
+              console.log(`[DevLog] Fetched ${repoCommitCache[cacheKey].length} commits from repo API for ${cacheKey}`);
+            } catch (err) {
+              console.log(`[DevLog] Could not fetch commits from repo API: ${err.message}`);
+              repoCommitCache[cacheKey] = [];
+            }
           }
+          commits = repoCommitCache[cacheKey];
         }
 
         for (const commit of commits) {
+          if (seenShas.has(commit.sha)) continue;
+          seenShas.add(commit.sha);
+
           activities.push({
             type: 'commit',
             github_event_id: `commit-${commit.sha}`,
-            repo_name: event.repo.name,
+            repo_name: repoName,
             title: commit.message.split('\n')[0],
             description: commit.message,
-            branch: event.payload.ref?.replace('refs/heads/', ''),
-            url: `https://github.com/${event.repo.name}/commit/${commit.sha}`,
+            branch,
+            url: `https://github.com/${repoName}/commit/${commit.sha}`,
             occurred_at: event.created_at,
             raw_data: commit,
           });
         }
 
-        // Last resort — if still no commits, log the push itself
+        // Last resort
         if (commits.length === 0) {
-          const branch = event.payload.ref?.replace('refs/heads/', '') || 'unknown';
-          activities.push({
-            type: 'commit',
-            github_event_id: `push-${event.id}`,
-            repo_name: event.repo.name,
-            title: `Pushed to ${branch}`,
-            description: `Push event with ${event.payload.size || 0} commits`,
-            branch,
-            url: `https://github.com/${event.repo.name}`,
-            occurred_at: event.created_at,
-            raw_data: event.payload,
-          });
+          const pushId = `push-${event.id}`;
+          if (!seenShas.has(pushId)) {
+            seenShas.add(pushId);
+            activities.push({
+              type: 'commit',
+              github_event_id: pushId,
+              repo_name: repoName,
+              title: `Pushed to ${branch}`,
+              description: `Push event with ${event.payload.size || 0} commits`,
+              branch,
+              url: `https://github.com/${repoName}`,
+              occurred_at: event.created_at,
+              raw_data: event.payload,
+            });
+          }
         }
       }
 
@@ -128,13 +131,10 @@ async function fetchRecentActivity(accessToken, username, daysBack = 1) {
     throw err;
   }
 
-  console.log(`[DevLog] Returning ${activities.length} activities to route handler`);
+  console.log(`[DevLog] Returning ${activities.length} deduplicated activities`);
   return activities;
 }
 
-/**
- * Group activities by repo, then by type within each repo
- */
 function groupActivities(activities) {
   const grouped = {};
 
@@ -152,24 +152,20 @@ function groupActivities(activities) {
   return grouped;
 }
 
-/**
- * Generate a plain-text standup summary from grouped activities
- */
 function generateSummary(grouped) {
   const lines = [];
   const repos = Object.keys(grouped);
 
   if (repos.length === 0) {
-    return "No activity found for this period.";
+    return 'No activity found for this period.';
   }
 
   for (const repo of repos) {
     const { commits, prs, reviews } = grouped[repo];
-    const shortRepo = repo.split('/').pop(); // "user/repo" -> "repo"
+    const shortRepo = repo.split('/').pop();
     lines.push(`**${shortRepo}**`);
 
     if (commits.length > 0) {
-      // Group commits by branch
       const byBranch = {};
       for (const c of commits) {
         const branch = c.branch || 'unknown';
@@ -207,10 +203,10 @@ function generateSummary(grouped) {
       }
     }
 
-    lines.push(''); // blank line between repos
+    lines.push('');
   }
 
   return lines.join('\n').trim();
-  }
+}
 
 module.exports = { fetchRecentActivity, groupActivities, generateSummary };

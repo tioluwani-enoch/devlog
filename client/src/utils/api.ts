@@ -25,6 +25,8 @@ export const fetchActivity = (days = 1) =>
     activities: Activity[];
     grouped: Record<string, { commits: Activity[]; prs: Activity[]; reviews: Activity[] }>;
     summary: string;
+    rawSummary: string;
+    aiSummary: string | null;
     count: number;
   }>(`/api/activity?days=${days}`);
 
